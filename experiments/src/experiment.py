@@ -1,128 +1,111 @@
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModelForSeq2SeqLM
-from typing import List, Dict, Union, Optional
-import numpy as np
-import os
-from pathlib import Path
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from typing import List, Dict
+from experiments.utils.evaluation import extract_final_answer, majority_vote, check_answer_correctness
 
-class ChainOfThoughtExperiment:
-    def __init__(self, 
-                 model_name: str = "facebook/opt-1.3b",
-                 offload_folder: Optional[str] = None):
 
-        print(f"Loading model: {model_name}")
+class DeepSeekR1Experiment:
+    def __init__(self, model_name: str = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"):
         
-        # offload folder if none
-        if offload_folder is None:
-            offload_folder = Path("model_offload")
-            offload_folder.mkdir(exist_ok=True)
-            offload_folder = str(offload_folder)
-    
-        if any(name in model_name for name in ["opt", "bloom", "gpt2"]):
-            self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-            self.model = AutoModelForCausalLM.from_pretrained(
-                model_name,
-                torch_dtype=torch.float16,
-                low_cpu_mem_usage=True,
-                device_map="auto",
-                offload_folder=offload_folder
-            )
-            self.is_causal = True
+        self.model_name = model_name
+        
+        print(f"Loading DeepSeek R1 model: {model_name}")
+        
+        # Check for MPS (Metal Performance Shaders) on MacBook
+        if torch.backends.mps.is_available():
+            self.device = torch.device("mps")
+            print(f"Using MPS device for acceleration")
+        elif torch.cuda.is_available():
+            self.device = torch.device("cuda")
+            print(f"Using CUDA device for acceleration")
         else:
-            self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-            self.model = AutoModelForSeq2SeqLM.from_pretrained(
-                model_name,
-                device_map="auto",
-                offload_folder=offload_folder
-            )
-            self.is_causal = False
-            
+            self.device = torch.device("cpu")
+            print(f"Using CPU device")
+        
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model_name,
+            trust_remote_code=True
+        )
+        
+        # For MPS device, use float32 instead of bfloat16 for better numerical stability
+        dtype = torch.float32 if self.device.type == "mps" else torch.bfloat16
+        
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            dtype=dtype,
+            trust_remote_code=True,
+        )
+        
+        # Move model to the appropriate device
+        self.model = self.model.to(self.device)
+        
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
-            
-        self.few_shot_examples = self._load_few_shot_examples()
-
-    def _load_few_shot_examples(self) -> List[Dict[str, str]]:
-
-        from experiments.data.problems import get_few_shot_examples
-        return get_few_shot_examples()
-
-    def generate_cot_prompt(self, question: str) -> str:
-
-        if self.is_causal:
-            prompt = "You are a mathematical reasoning expert. Solve these math word problems step by step, showing all calculations clearly:\n\n"
-        else:
-            prompt = "Solve these math word problems step by step:\n\n"
-            
-        for example in self.few_shot_examples:
-            prompt += f"Question: {example['question']}\n{example['solution']}\n\n"
         
-        prompt += f"Question: {question}\nLet's solve this step by step:\n1)"
+    def build_deepseek_prompt(self, question: str) -> str:
+        system_prompt = "You are a mathematical reasoning expert. Solve these math word problems step by step. Provide your final answer in the format: #### [number]"
         
-        return prompt
-
+        few_shot_text = ""
+        
+        full_prompt = f"{system_prompt}\n\n{few_shot_text}Question: {question}\nLet's solve this step by step:\n"
+        
+        return full_prompt
+    
     def generate_reasoning_paths(self, 
                                question: str, 
                                num_samples: int = 5, 
                                temperature: float = 0.7, 
-                               max_length: int = 512) -> List[str]:
+                               max_length: int = 1024,
+                               top_p: float = 0.95,
+                               top_k: int = 50) -> List[str]:
         
-        # Generate multiple reasoning paths for a question
+        prompt = self.build_deepseek_prompt(question)
 
-        prompt = self.generate_cot_prompt(question)
-        inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True)
-        inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
+        inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True).to(self.model.device)
         
         paths = []
-        for _ in range(num_samples):
-            try:
-                outputs = self.model.generate(
-                    **inputs,
-                    max_length=max_length,
-                    do_sample=True,
-                    temperature=temperature,
-                    num_beams=4,
-                    top_p=0.95,
-                    no_repeat_ngram_size=3,
-                    pad_token_id=self.tokenizer.pad_token_id,
-                    num_return_sequences=1
-                )
-                
-                decoded = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-                if self.is_causal:
-                    generated_text = decoded[len(prompt):]
-                else:
-                    generated_text = decoded
-                    
-                paths.append(generated_text.strip())
-                
-            except Exception as e:
-                print(f"Error in generation: {str(e)}")
-                paths.append("")
-                
-        return paths
 
+        for i in range(num_samples):
+            with torch.no_grad():
+                outputs = self.model.generate(
+                        **inputs,
+                        max_new_tokens=max_length,
+                        do_sample=True,
+                        temperature=temperature,
+                        top_p=top_p,
+                        top_k=top_k,
+                        pad_token_id=self.tokenizer.pad_token_id,
+                        eos_token_id=self.tokenizer.eos_token_id
+                    )
+            
+            
+            generated_text = self.tokenizer.decode(outputs[0].to(torch.int32).cpu().numpy(), skip_special_tokens=True)
+                
+            if "Let's solve this step by step:" in generated_text:
+                generated_text = generated_text.split("Let's solve this step by step:")[-1].strip()
+                
+            paths.append(generated_text.strip())
+
+        return paths
+    
     def evaluate_question(self, 
                          question: str, 
                          correct_answer: str,
-                         num_samples: int = 1) -> Dict:
-        #Evaluate a single question using both standard CoT and self-consistency
-        from experiments.utils.evaluation import (
-            extract_final_answer,
-            majority_vote,
-            check_answer_correctness
-        )
-        
-        # vanilla COT
-        standard_path = self.generate_reasoning_paths(question, num_samples=1)[0]
+                         num_samples: int = 5,
+                         temperature: float = 0.7,
+                         max_length: int = 1024,
+                         top_p: float = 0.95,
+                         top_k: int = 50) -> Dict:
+        standard_path = self.generate_reasoning_paths(
+            question, num_samples=1, temperature=temperature, max_length=max_length, top_p=top_p, top_k=top_k)[0]
         standard_answer = extract_final_answer(standard_path)
         
-        # Self-consistency paths
-        paths = self.generate_reasoning_paths(question, num_samples=num_samples)
+        paths = self.generate_reasoning_paths(question, num_samples=num_samples, temperature=temperature, max_length=max_length, top_p=top_p, top_k=top_k)
+        for i, path in enumerate(paths):
+            print(f"Path {i+1}: {path}")
         answers = [extract_final_answer(path) for path in paths]
         sc_answer = majority_vote(answers)
         
-        # Check
         standard_correct = check_answer_correctness(standard_answer, correct_answer)
         sc_correct = check_answer_correctness(sc_answer, correct_answer)
         

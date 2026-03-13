@@ -3,13 +3,13 @@ import re
 
 def extract_final_answer(text: str) -> Optional[str]:
     """Extract the final numerical answer from the reasoning path."""
-    # Look for "Therefore"
-    therefore_match = re.search(r"Therefore,.*?(\d+)", text, re.IGNORECASE)
-    if therefore_match:
-        return therefore_match.group(1)
-    
+    # Look for GSM8K format: #### [answer]
+    gsm8k_match = re.search(r"####\s*([\d.]+)", text)
+    if gsm8k_match:
+        return gsm8k_match.group(1)
+
     # Look for the last number in the text as fallback
-    numbers = re.findall(r"(\d+)", text)
+    numbers = re.findall(r"([\d.]+)", text)
     return numbers[-1] if numbers else None
 
 def majority_vote(answers: List[str]) -> Optional[str]:
@@ -17,9 +17,13 @@ def majority_vote(answers: List[str]) -> Optional[str]:
     valid_answers = [ans for ans in answers if ans is not None]
     if not valid_answers:
         return None
-        
     # Convert answers to float for comparison
-    float_answers = [float(ans) for ans in valid_answers]
+    float_answers = []
+    for ans in valid_answers:
+        try:
+            float_answers.append(float(ans))
+        except ValueError:
+            continue
 
     grouped_answers = []
     for ans in float_answers:
